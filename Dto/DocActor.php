@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace MultiTenantSaas\Modules\Archive\Dto;
 
 use MultiTenantSaas\Context\ExecutionIdentity;
+use MultiTenantSaas\Modules\Archive\Exceptions\ArchiveException;
 
 /**
  * 档案中心执行主体（服务层授权的显式输入）。
@@ -58,7 +59,7 @@ final readonly class DocActor
     public static function fromIdentity(?ExecutionIdentity $identity, array $abilities = []): self
     {
         if ($identity === null) {
-            return self::system();
+            throw ArchiveException::forbidden('execution_identity_missing', '缺少执行身份');
         }
 
         $roles = array_values(array_map('strval', array_filter(
