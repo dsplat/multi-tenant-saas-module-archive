@@ -283,7 +283,7 @@ final class DocCatalogService
             ->where('tenant_id', $tenantId)
             ->where(function ($builder) use ($oldPath): void {
                 $builder->where('path', $oldPath)
-                    ->orWhereRaw("path LIKE ? ESCAPE '\\'", [$this->prefixPattern($oldPath)]);
+                    ->orWhereRaw("path LIKE ? ESCAPE '!'", [$this->prefixPattern($oldPath)]);
             })
             ->lockForUpdate()
             ->get();
@@ -515,7 +515,7 @@ final class DocCatalogService
             ->whereNotIn('catalog_id', $subtreeIds)
             ->where(function ($builder) use ($newPath): void {
                 $builder->where('path', $newPath)
-                    ->orWhereRaw("path LIKE ? ESCAPE '\\'", [$this->prefixPattern($newPath)]);
+                    ->orWhereRaw("path LIKE ? ESCAPE '!'", [$this->prefixPattern($newPath)]);
             })
             ->exists();
 
@@ -535,7 +535,7 @@ final class DocCatalogService
             ->where('tenant_id', $tenantId)
             ->where(function ($builder) use ($oldPath): void {
                 $builder->where('provider_path', $oldPath)
-                    ->orWhereRaw("provider_path LIKE ? ESCAPE '\\'", [$this->prefixPattern($oldPath)]);
+                    ->orWhereRaw("provider_path LIKE ? ESCAPE '!'", [$this->prefixPattern($oldPath)]);
             })
             ->get();
 
@@ -605,7 +605,7 @@ final class DocCatalogService
             ->where('tenant_id', $tenantId)
             ->where(function ($builder) use ($oldPath): void {
                 $builder->where('provider_path', $oldPath)
-                    ->orWhereRaw("provider_path LIKE ? ESCAPE '\\'", [$this->prefixPattern($oldPath)]);
+                    ->orWhereRaw("provider_path LIKE ? ESCAPE '!'", [$this->prefixPattern($oldPath)]);
             })
             ->get();
 
@@ -674,7 +674,9 @@ final class DocCatalogService
 
     private function prefixPattern(string $path): string
     {
-        return addcslashes($path, '\\%_') . '/%';
+        // 用 '!' 作 LIKE 转义符：SQL 里 ESCAPE '\' 在 MySQL 是未闭合字符串（sqlite 却合法），
+        // 会让「前缀子树查询」在生产 MySQL 直接语法错误（nightly 2026-10-26 实测）。
+        return str_replace(['!', '%', '_'], ['!!', '!%', '!_'], $path) . '/%';
     }
 
     private function isUniqueViolation(QueryException $exception): bool
