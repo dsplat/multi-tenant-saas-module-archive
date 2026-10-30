@@ -93,6 +93,8 @@ class CatalogController extends BaseController
             'provider' => 'nullable|string|max:50',
             'status' => 'nullable|string|in:active,archived',
             'metadata' => 'nullable|array',
+            // 仅校验/估算，不移动 provider 文件、不改目录路径。
+            'dry_run' => 'sometimes|boolean',
         ]);
 
         $catalog = $this->catalogs->update(
@@ -102,7 +104,10 @@ class CatalogController extends BaseController
             $this->docActor(['view' => true, 'manage_catalogs' => true]),
         );
 
-        return $this->successResponse((new DocCatalogResource($catalog))->resolve(), '目录已更新');
+        return $this->successResponse(
+            (new DocCatalogResource($catalog))->resolve(),
+            filter_var($validated['dry_run'] ?? false, FILTER_VALIDATE_BOOLEAN) ? '预检通过，未执行移动' : '目录已更新',
+        );
     }
 
     public function destroy(string $id): JsonResponse

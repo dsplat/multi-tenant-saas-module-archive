@@ -7,7 +7,6 @@ namespace MultiTenantSaas\Modules\Archive\Services;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Log;
 use MultiTenantSaas\Access\DataScopeContext;
 use MultiTenantSaas\Context\TenantContext;
 use MultiTenantSaas\Contracts\AuditLoggerContract;
@@ -20,6 +19,7 @@ use MultiTenantSaas\Modules\Archive\Exceptions\ArchiveProviderFailure;
 use MultiTenantSaas\Modules\Archive\Exceptions\DocProviderException;
 use MultiTenantSaas\Modules\Archive\Models\DocCatalog;
 use MultiTenantSaas\Modules\Archive\Models\DocItem;
+use MultiTenantSaas\Modules\Archive\Models\DocMoveOperation;
 use Throwable;
 
 /**
@@ -35,6 +35,7 @@ final class DocCatalogService
         private readonly DocPathNormalizer $paths,
         private readonly DocProviderRegistryContract $providers,
         private readonly AuditLoggerContract $audit,
+        private readonly DocMoveOperationService $moveOperations,
     ) {}
 
     /**
@@ -290,12 +291,23 @@ final class DocCatalogService
 
         $subtreeIds = $subtree->map(fn (DocCatalog $node) => (int) $node->catalog_id)->all();
 
+        $dryRun = filter_var($input['dry_run'] ?? false, FILTER_VALIDATE_BOOLEAN);
+        $moveResult = ['batch_id' => null, 'planned' => 0];
+
         if ($newPath !== $oldPath) {
             $this->assertSubtreePathAvailable($tenantId, (int) ($catalog->project_id ?? 0), $subtreeIds, $oldPath, $newPath);
 
-            $moved = $this->moveProviderFiles($tenantId, $catalog, $oldPath, $newPath);
-        } else {
-            $moved = [];
+            if ($dryRun) {
+                $this->moveProviderFiles($tenantId, $catalog, $oldPath, $newPath, true);
+
+                return $catalog->refresh();
+            }
+
+            $moveResult = $this->moveProviderFiles($tenantId, $catalog, $oldPath, $newPath, false);
+        }
+
+        if ($dryRun) {
+            return $catalog->refresh();
         }
 
         try {
@@ -306,7 +318,9 @@ final class DocCatalogService
                 $newPath,
                 $newParent,
                 $name,
-                $input
+                $input,
+                $moveResult,
+                $tenantId
             ): DocCatalog {
                 foreach ($subtree as $node) {
                     $nodePath = $this->paths->relocate($oldPath, $newPath, (string) $node->path);
@@ -338,12 +352,16 @@ final class DocCatalogService
                     $this->updateItemPaths($catalog->tenant_id !== null ? (int) $catalog->tenant_id : 0, $oldPath, $newPath);
                 }
 
+                // 只有目录/文档路径事务真正提交，才把批次标记为终结；
+                // 半移动（含本事务失败）保持 completed_at NULL 供恢复入口发现。
+                if (is_string($moveResult['batch_id'] ?? null)) {
+                    $this->moveOperations->completeBatch($tenantId, $moveResult['batch_id']);
+                }
+
                 return $catalog->refresh();
             });
         } catch (QueryException $exception) {
-            if ($moved !== []) {
-                $this->rollbackProviderMoves($tenantId, $moved);
-            }
+            $this->rollbackMovedBatch($tenantId, $moveResult);
 
             if ($this->isUniqueViolation($exception)) {
                 throw ArchiveException::conflict('catalog_exists', '目标路径已存在');
@@ -351,9 +369,7 @@ final class DocCatalogService
 
             throw $exception;
         } catch (Throwable $exception) {
-            if ($moved !== []) {
-                $this->rollbackProviderMoves($tenantId, $moved);
-            }
+            $this->rollbackMovedBatch($tenantId, $moveResult);
 
             throw $exception;
         }
@@ -367,6 +383,41 @@ final class DocCatalogService
         ]);
 
         return $catalog;
+    }
+
+    /**
+     * 列出本租户未终结的目录移动批次与条目（恢复入口）。
+     *
+     * 未终结包含 pending / failed / moved 且批次未 completed 的记录；调用方
+     * 可据此按 operation_id 调用 retryMoveOperation / rollbackMoveOperation。
+     *
+     * @return list<array<string, mixed>>
+     */
+    public function incompleteMoveBatches(int $tenantId, DocActor $actor): array
+    {
+        $this->assertTenant($tenantId);
+
+        return $this->moveOperations->incompleteBatches($tenantId, $actor);
+    }
+
+    /**
+     * 按条目重试 provider 移动（幂等：已 moved / rolled_back 不重复调用 provider）。
+     */
+    public function retryMoveOperation(int $tenantId, int|string $operationId, DocActor $actor): DocMoveOperation
+    {
+        $this->assertTenant($tenantId);
+
+        return $this->moveOperations->retry($tenantId, $operationId, $actor);
+    }
+
+    /**
+     * 按条目回滚 provider 移动（幂等：已 rolled_back 不重复调用 provider）。
+     */
+    public function rollbackMoveOperation(int $tenantId, int|string $operationId, DocActor $actor): DocMoveOperation
+    {
+        $this->assertTenant($tenantId);
+
+        return $this->moveOperations->rollback($tenantId, $operationId, $actor);
     }
 
     /**
@@ -525,12 +576,20 @@ final class DocCatalogService
     }
 
     /**
-     * 移动子树内已存在的 provider 文件；不支持移动时显式失败。
+     * 移动子树内已存在的 provider 文件；不支持移动/超过规模上限时显式失败。
      *
-     * @return list<array{provider: string, from: string, to: string}>
+     * 先落 pending 账本再逐项调用 provider：provider 是外部副作用，不能与本地
+     * DB 事务原子提交；先写后调保证崩溃后仍能列出半移动范围。
+     *
+     * @return array{batch_id: string|null, planned: int}
      */
-    private function moveProviderFiles(int $tenantId, DocCatalog $catalog, string $oldPath, string $newPath): array
-    {
+    private function moveProviderFiles(
+        int $tenantId,
+        DocCatalog $catalog,
+        string $oldPath,
+        string $newPath,
+        bool $dryRun,
+    ): array {
         $items = DocItem::query()
             ->where('tenant_id', $tenantId)
             ->where(function ($builder) use ($oldPath): void {
@@ -540,7 +599,7 @@ final class DocCatalogService
             ->get();
 
         if ($items->isEmpty()) {
-            return [];
+            return ['batch_id' => null, 'planned' => 0];
         }
 
         $providerName = (string) $catalog->provider;
@@ -555,7 +614,7 @@ final class DocCatalogService
             );
         }
 
-        $moved = [];
+        $plan = [];
 
         foreach ($items as $item) {
             if ($item->provider_file_ref === null || $item->provider_path === null) {
@@ -568,34 +627,64 @@ final class DocCatalogService
                 continue;
             }
 
-            $this->providerCall(fn () => $provider->moveFile((string) $item->provider_file_ref, $targetPath));
-
-            $moved[] = [
-                'provider' => (string) $item->provider,
-                'from' => (string) $item->provider_path,
-                'to' => $targetPath,
+            $plan[] = [
+                'provider_file_ref' => (string) $item->provider_file_ref,
+                'from_path' => (string) $item->provider_path,
+                'to_path' => $targetPath,
             ];
         }
 
-        return $moved;
+        if ($plan === []) {
+            return ['batch_id' => null, 'planned' => 0];
+        }
+
+        $limit = $this->moveOperations->maxFiles();
+
+        if (count($plan) > $limit) {
+            throw ArchiveException::unprocessable(
+                'move_limit_exceeded',
+                sprintf('单次目录移动最多 %d 个文件，本次需移动 %d 个，请拆分目录后重试', $limit, count($plan)),
+            );
+        }
+
+        if ($dryRun) {
+            return ['batch_id' => null, 'planned' => count($plan)];
+        }
+
+        $batchId = $this->moveOperations->beginBatch($tenantId, (int) $catalog->catalog_id, $providerName, $plan);
+
+        foreach ($this->moveOperations->operationsForBatch($tenantId, $batchId) as $operation) {
+            $this->moveOperations->markAttempt($operation);
+
+            try {
+                $file = $this->providerCall(fn () => $provider->moveFile(
+                    (string) $operation->provider_file_ref,
+                    (string) $operation->to_path,
+                ));
+
+                $this->moveOperations->markMoved($operation, $file->ref);
+            } catch (Throwable $exception) {
+                $this->moveOperations->markFailed($operation, $exception);
+                $this->moveOperations->rollbackBatch($tenantId, $batchId);
+
+                throw $exception;
+            }
+        }
+
+        return ['batch_id' => $batchId, 'planned' => count($plan)];
     }
 
     /**
-     * @param  list<array{provider: string, from: string, to: string}>  $moved
+     * DB 事务失败后的补偿：以账本为准（内存数组不再作为唯一事实源）。
+     *
+     * @param  array{batch_id: string|null, planned: int}  $moveResult
      */
-    private function rollbackProviderMoves(int $tenantId, array $moved): void
+    private function rollbackMovedBatch(int $tenantId, array $moveResult): void
     {
-        foreach (array_reverse($moved) as $move) {
-            try {
-                $this->provider($tenantId, $move['provider'])->moveFile($move['to'], $move['from']);
-            } catch (Throwable $exception) {
-                Log::warning('archive.catalog_move_rollback_failed', [
-                    'tenant_id' => $tenantId,
-                    'from' => $move['from'],
-                    'to' => $move['to'],
-                    'error' => $exception->getMessage(),
-                ]);
-            }
+        $batchId = $moveResult['batch_id'] ?? null;
+
+        if (is_string($batchId)) {
+            $this->moveOperations->rollbackBatch($tenantId, $batchId);
         }
     }
 
