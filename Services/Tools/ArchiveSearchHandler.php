@@ -4,14 +4,28 @@ declare(strict_types=1);
 
 namespace MultiTenantSaas\Modules\Archive\Services\Tools;
 
+use MultiTenantSaas\Access\DataScopeContext;
+use MultiTenantSaas\Contracts\DataScopeCapableContract;
 use MultiTenantSaas\Modules\Ai\Services\Agent\Contracts\ToolHandlerContract;
 use MultiTenantSaas\Modules\Archive\Services\DocItemService;
 
 /**
  * L1：搜索档案文档（仅元数据，不返回正文）。
  */
-final class ArchiveSearchHandler implements ToolHandlerContract
+final class ArchiveSearchHandler implements DataScopeCapableContract, ToolHandlerContract
 {
+    private ?DataScopeContext $dataScope = null;
+
+    /**
+     * 档案查询层（DocItemService::baseQuery/find）在构建期消费
+     * DataScopeContext::ambient()；这里保留显式接收点，确保 ToolRegistry
+     * 的 restricted 决策不会被当成“已限行”标记跳过。
+     */
+    public function acceptDataScope(DataScopeContext $scope): void
+    {
+        $this->dataScope = $scope;
+    }
+
     use ResolvesDocActor;
 
     public function __construct(private readonly DocItemService $items) {}
