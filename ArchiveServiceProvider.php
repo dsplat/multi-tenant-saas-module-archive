@@ -223,7 +223,12 @@ class ArchiveServiceProvider extends ModuleServiceProvider
             return;
         }
 
-        $this->app->make(SceneRegistryContract::class)
-            ->registerScene('archive', '档案中心', 'FolderOpened', '项目档案目录、文档元数据与引用账本', 100);
+        $registry = $this->app->make(SceneRegistryContract::class);
+
+        $registry->registerScene('archive', '档案中心', 'FolderOpened', '项目档案目录、文档元数据与引用账本', 100);
+        $registry->registerCard('archive-documents', 'archive', '档案检索', '检索项目档案与文档引用', null, null, '/archive', null, [
+            'action_label' => '去检索',
+            'permission' => 'archive.view',
+        ]);
     }
 }
